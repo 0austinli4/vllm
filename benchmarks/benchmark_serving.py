@@ -294,7 +294,7 @@ async def benchmark(
         api_url=api_url,
         prompt_len=test_prompt_len,
         output_len=test_output_len,
-        logprobs=logprobs,
+        logprobs=False,
         multi_modal_content=test_mm_content,
         ignore_eos=ignore_eos,
     )

@@ -406,8 +406,7 @@ async def async_request_openai_chat_completions(
             },
             "cache_hint": get_cache_hint(request_func_input),
         }
-        #if request_func_input.conversation_id in [39, 86]:
-        #    print(request_func_input, get_cache_hint(request_func_input))
+        print("Sending in following payload", payload)
         if request_func_input.ignore_eos:
             payload["ignore_eos"] = request_func_input.ignore_eos
         if request_func_input.extra_body:
@@ -481,10 +480,11 @@ async def async_request_openai_chat_completions(
         n_running_req -= 1
         n_completed_req += 1
         if n_completed_req % 100 == 0:
-            metrics_url = f"{request_func_input.api_url.replace("v1/chat/completions", "")}metrics"
+            metrics_url = f'{request_func_input.api_url.replace("v1/chat/completions", "")}metrics'
             response = requests.get(metrics_url)
             for line in response.text.split("\n"):
-                if "gpu_prefix_cache_hit_rate{" in line:
+                # for sglang
+                if "cache_hit_rate{" in line:
                     print(line)
 
     if pbar:
@@ -549,5 +549,5 @@ ASYNC_REQUEST_FUNCS = {
     "openai-chat": async_request_openai_chat_completions,
     "tensorrt-llm": async_request_trt_llm,
     "scalellm": async_request_openai_completions,
-    "sglang": async_request_openai_completions,
+    "sglang": async_request_openai_chat_completions,
 }
