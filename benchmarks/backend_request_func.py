@@ -20,6 +20,8 @@ from transformers import (AutoTokenizer, PreTrainedTokenizer,
 from vllm.model_executor.model_loader.weight_utils import get_lock
 
 AIOHTTP_TIMEOUT = aiohttp.ClientTimeout(total=6 * 60 * 60)
+import logging
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -371,7 +373,9 @@ async def async_request_openai_chat_completions(
                 "role": "user",
                 "content": content
             }
+        # logger.info(f"Appending latest message to convo history {conversation_id}, {user_message}")
         conversation_history[conversation_id].append(user_message)
+        # print("new convo history, ", conversation_history[conversation_id])
         return conversation_history[conversation_id]
     
     def get_cache_hint(request_func_input):
@@ -400,15 +404,15 @@ async def async_request_openai_chat_completions(
             "messages": get_messages(request_func_input),
             "temperature": 0.0,
             "max_completion_tokens": request_func_input.output_len,
+            "max_tokens": request_func_input.output_len,
             "stream": True,
             "stream_options": {
                 "include_usage": True,
             },
             "cache_hint": get_cache_hint(request_func_input),
         }
-        print("Sending in following payload", payload)
         if request_func_input.ignore_eos:
-            payload["ignore_eos"] = request_func_input.ignore_eos
+            payload["ignore_eos"] = False
         if request_func_input.extra_body:
             payload.update(request_func_input.extra_body)
         headers = {
@@ -426,6 +430,7 @@ async def async_request_openai_chat_completions(
         n_running_req += 1
         #print(round(time.time()-start_time,2), request_func_input.timestamp, 
         #      request_func_input.conversation_id, n_completed_req)
+        # print("[REQUEST CONVERSATION ID]", payload)
         try:
             async with session.post(url=api_url, json=payload,
                                     headers=headers) as response:
@@ -461,6 +466,8 @@ async def async_request_openai_chat_completions(
                             most_recent_timestamp = timestamp
 
                     output.generated_text = generated_text
+                    # print("[OUTPUTED GENERATED TEXT]", output.generated_text)
+                    # print("[FINISH OUTPUT GENRATED TEXT]")
                     update_conversation(request_func_input.conversation_id, generated_text)
                     output.success = True
                     output.latency = most_recent_timestamp - st
@@ -479,13 +486,13 @@ async def async_request_openai_chat_completions(
             output.error = "".join(traceback.format_exception(*exc_info))
         n_running_req -= 1
         n_completed_req += 1
-        if n_completed_req % 100 == 0:
-            metrics_url = f'{request_func_input.api_url.replace("v1/chat/completions", "")}metrics'
-            response = requests.get(metrics_url)
-            for line in response.text.split("\n"):
+        # if n_completed_req % 10 == 0:
+        #     metrics_url = f'{request_func_input.api_url.replace("v1/chat/completions", "")}metrics'
+        #     response = requests.get(metrics_url)
+            # for line in response.text.split("\n"):
                 # for sglang
-                if "cache_hit_rate{" in line:
-                    print(line)
+                # if "sglang:cache_hit_rate{" in line or "sglang:num_running_reqs{" in line:
+                    # print(line)
 
     if pbar:
         pbar.update(1)

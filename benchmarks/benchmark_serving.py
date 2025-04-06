@@ -424,8 +424,9 @@ async def benchmark(
     )
     metrics_url = f"{base_url}/metrics"
     response = requests.get(metrics_url)
+
     for line in response.text.split("\n"):
-        if "gpu_prefix_cache_hit_rate{" in line:
+        if "cache_hit_rate" in line:
             print(line)
             hit_ratio=line.split(' ')[-1]
 

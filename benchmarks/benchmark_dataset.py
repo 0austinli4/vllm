@@ -23,7 +23,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from functools import cache
 from typing import Any, Optional, Union
-
+import os
 import numpy as np
 import pandas as pd
 from datasets import load_dataset
@@ -34,7 +34,9 @@ from vllm.lora.request import LoRARequest
 from vllm.lora.utils import get_adapter_absolute_path
 from vllm.multimodal import MultiModalDataDict
 from vllm.transformers_utils.tokenizer import AnyTokenizer, get_lora_tokenizer
-
+import logging
+logger = logging.getLogger(__name__)
+from dataclasses import asdict
 # -----------------------------------------------------------------------------
 # Data Classes
 # -----------------------------------------------------------------------------
@@ -348,7 +350,10 @@ class ShareGPTDataset(BenchmarkDataset):
                **kwargs) -> list:
         samples: list = []
         conv_timestamp = 0
+        counter_temp_remove_later = 0
         for entry in self.data:
+            counter_temp_remove_later+=1
+            # print("my counter ", counter_temp_remove_later)
             #if len(entry["conversations"])//2 != 1:
             #    continue
             conv_timestamp += np.random.exponential(conv_scale)
@@ -360,6 +365,11 @@ class ShareGPTDataset(BenchmarkDataset):
                     break
                 prompt, completion = entry["conversations"][turn * 2]["value"],\
                     entry["conversations"][turn * 2 + 1]["value"]
+                
+                if "timestamp" not in entry["conversations"][turn * 2]:
+                    print(entry["conversations"][turn*2])
+                else:
+                    req_timestamp += entry["conversations"][turn * 2]["timestamp"]
 
                 lora_request, tokenizer = self.get_random_lora_request(
                     tokenizer=tokenizer, max_loras=max_loras, lora_path=lora_path)
@@ -368,6 +378,12 @@ class ShareGPTDataset(BenchmarkDataset):
                 prompt_len = len(prompt_ids)
                 new_output_len = (len(completion_ids)
                                 if output_len is None else output_len)
+                # add the actual timestamp from tay
+                
+
+                # print("Added request timestamp", req_timestamp, entry["id"])
+                # print("Creating dataset", self.conversation_id)
+                # print("[DEBUG] EXPECTED OUTPUT LENGTH: ", prompt, "output len: ", new_output_len)
                 #if turn == len(entry["conversations"])//2 - 1:
                 #    new_output_len = 1
                 #if not is_valid_sequence(prompt_len,
@@ -375,6 +391,7 @@ class ShareGPTDataset(BenchmarkDataset):
                 #                        skip_min_output_len_check=output_len
                 #                        is not None):
                 #    continue
+                # MANUALLY RESTRICT OUTPUT LENGHT
                 samples.append(
                     SampleRequest(
                         prompt=prompt,
@@ -385,12 +402,24 @@ class ShareGPTDataset(BenchmarkDataset):
                         turn_id=turn*2,
                         timestamp=req_timestamp,
                     ))
-                req_timestamp += np.random.exponential(req_scale)
+                
                 if (turn+1) * 2 + 1 < len(entry["conversations"]):
                     samples[-1].next_timestamp = req_timestamp
             self.conversation_id += 1
         # random.shuffle(samples) # todo
         samples.sort(key=lambda x: x.timestamp)
+        # # New JSON writing logic
+        # output_dir = '/scratch/gpfs/al2926/.cache/huggingface/'
+        # os.makedirs(output_dir, exist_ok=True)
+        # output_path = os.path.join(output_dir, 'sampled_requests_SHAREGPT.json')
+        
+        # # Convert SampleRequest objects to dictionaries
+        # serialized_samples = [asdict(sample) for sample in samples]  # Use sample.__dict__ if not using dataclasses
+        
+        # # Write to JSON file
+        # with open(output_path, 'w') as f:
+        #     json.dump(serialized_samples, f, indent=2)
+        
         return samples
 
 
