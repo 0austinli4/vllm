@@ -1022,7 +1022,7 @@ def main(args: argparse.Namespace):
 
 if __name__ == "__main__":
     parser = FlexibleArgumentParser(
-        description="Benchmark the online serving throughput.")
+        description="Benchmark the online serving throughput. change")
     parser.add_argument(
         "--backend",
         type=str,
