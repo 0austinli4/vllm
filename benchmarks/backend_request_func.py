@@ -430,7 +430,7 @@ async def async_request_openai_chat_completions(
         n_running_req += 1
         #print(round(time.time()-start_time,2), request_func_input.timestamp, 
         #      request_func_input.conversation_id, n_completed_req)
-        # print("[REQUEST CONVERSATION ID]", payload)
+        # print("[REQUEST INPUT]", payload)
         try:
             async with session.post(url=api_url, json=payload,
                                     headers=headers) as response:
@@ -446,13 +446,15 @@ async def async_request_openai_chat_completions(
                             timestamp = time.perf_counter()
                             data = json.loads(chunk)
 
+                            # print(f"DEBUG: Parsed data: {data}")
+
                             if choices := data.get("choices"):
                                 content = choices[0]["delta"].get("content")
+                                # print(f"DEBUG: Content received: {content}")
                                 # First token
                                 if ttft == 0.0:
                                     ttft = timestamp - st
                                     output.ttft = ttft
-
                                 # Decoding phase
                                 else:
                                     output.itl.append(timestamp -
@@ -466,7 +468,7 @@ async def async_request_openai_chat_completions(
                             most_recent_timestamp = timestamp
 
                     output.generated_text = generated_text
-                    # print("[OUTPUTED GENERATED TEXT]", output.generated_text)
+                    # logger.warning("[OUTPUTED GENERATED TEXT] " + output.generated_text)
                     # print("[FINISH OUTPUT GENRATED TEXT]")
                     update_conversation(request_func_input.conversation_id, generated_text)
                     output.success = True

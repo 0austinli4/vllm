@@ -332,10 +332,12 @@ class ShareGPTDataset(BenchmarkDataset):
         with open(self.dataset_path, encoding="utf-8") as f:
             self.data = json.load(f)
         # Filter entries with at least two conversation turns.
+        logger.warning(f"Before filtering {len(self.data)}")
         self.data = [
             entry for entry in self.data
             if "conversations" in entry and len(entry["conversations"]) >= 2
         ]
+        logger.warning(f"Post filtering {len(self.data)}")
         random.seed(self.random_seed)
         random.shuffle(self.data)
 
@@ -345,17 +347,14 @@ class ShareGPTDataset(BenchmarkDataset):
                lora_path: Optional[str] = None,
                max_loras: Optional[int] = None,
                output_len: Optional[int] = None,
-               conv_scale: float = 0.25,
+               # MODIFIED FROM 0.25
+               conv_scale: float = 1.0,
+               # what is this parameter?
                req_scale: float = 10,
                **kwargs) -> list:
         samples: list = []
         conv_timestamp = 0
-        counter_temp_remove_later = 0
         for entry in self.data:
-            counter_temp_remove_later+=1
-            # print("my counter ", counter_temp_remove_later)
-            #if len(entry["conversations"])//2 != 1:
-            #    continue
             conv_timestamp += np.random.exponential(conv_scale)
             req_timestamp = conv_timestamp
             for turn in range(len(entry["conversations"])//2):
@@ -365,11 +364,16 @@ class ShareGPTDataset(BenchmarkDataset):
                     break
                 prompt, completion = entry["conversations"][turn * 2]["value"],\
                     entry["conversations"][turn * 2 + 1]["value"]
-                
+
                 if "timestamp" not in entry["conversations"][turn * 2]:
-                    print(entry["conversations"][turn*2])
+                    req_timestamp += np.random.exponential(req_scale) + 5
+                    print("Entry without timestamp", entry["conversations"][turn * 2])
                 else:
-                    req_timestamp += entry["conversations"][turn * 2]["timestamp"]
+                    if (turn+1) * 2 + 1 < len(entry["conversations"]):
+                        if "timestamp" not in entry["conversations"][(turn+1) * 2]:
+                            print("Entry without timestamp inside turn + 1", entry["conversations"][turn * 2])
+                        else:
+                            req_timestamp = conv_timestamp + entry["conversations"][(turn+1) * 2]["timestamp"] * req_scale
 
                 lora_request, tokenizer = self.get_random_lora_request(
                     tokenizer=tokenizer, max_loras=max_loras, lora_path=lora_path)
@@ -378,20 +382,11 @@ class ShareGPTDataset(BenchmarkDataset):
                 prompt_len = len(prompt_ids)
                 new_output_len = (len(completion_ids)
                                 if output_len is None else output_len)
-                # add the actual timestamp from tay
-                
-
-                # print("Added request timestamp", req_timestamp, entry["id"])
-                # print("Creating dataset", self.conversation_id)
-                # print("[DEBUG] EXPECTED OUTPUT LENGTH: ", prompt, "output len: ", new_output_len)
-                #if turn == len(entry["conversations"])//2 - 1:
-                #    new_output_len = 1
                 #if not is_valid_sequence(prompt_len,
                 #                        new_output_len,
                 #                        skip_min_output_len_check=output_len
                 #                        is not None):
                 #    continue
-                # MANUALLY RESTRICT OUTPUT LENGHT
                 samples.append(
                     SampleRequest(
                         prompt=prompt,
@@ -408,17 +403,6 @@ class ShareGPTDataset(BenchmarkDataset):
             self.conversation_id += 1
         # random.shuffle(samples) # todo
         samples.sort(key=lambda x: x.timestamp)
-        # # New JSON writing logic
-        # output_dir = '/scratch/gpfs/al2926/.cache/huggingface/'
-        # os.makedirs(output_dir, exist_ok=True)
-        # output_path = os.path.join(output_dir, 'sampled_requests_SHAREGPT.json')
-        
-        # # Convert SampleRequest objects to dictionaries
-        # serialized_samples = [asdict(sample) for sample in samples]  # Use sample.__dict__ if not using dataclasses
-        
-        # # Write to JSON file
-        # with open(output_path, 'w') as f:
-        #     json.dump(serialized_samples, f, indent=2)
         
         return samples
 

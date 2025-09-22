@@ -974,6 +974,8 @@ def apply_hf_chat_template(
     tokenize: bool = False,  # Different from HF's default
     **kwargs: Any,
 ) -> str:
+    # chat_template = "{%- for message in messages %}{%- if message['role'] == 'user' %}{{ '<|im_start|>user\n' + message['content'] + '<|im_end|>\n' }}{%- elif message['role'] == 'assistant' %}{{ '<|im_start|>assistant\n' + message['content'] + '<|im_end|>\n' }}{%- endif %}{%- endfor %}"
+    
     if chat_template is None and tokenizer.chat_template is None:
         raise ValueError(
             "As of transformers v4.44, default chat template is no longer "

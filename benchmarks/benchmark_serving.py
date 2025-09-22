@@ -299,14 +299,13 @@ async def benchmark(
         ignore_eos=ignore_eos,
     )
 
-    test_output = await request_func(request_func_input=test_input)
-    if not test_output.success:
-        raise ValueError(
-            "Initial test run failed - Please make sure benchmark arguments "
-            f"are correctly specified. Error: {test_output}")
-    else:
-        print("Initial test run completed. Starting main benchmark run...")
-    response = requests.post(base_url + "/reset_prefix_cache")
+    # test_output = await request_func(request_func_input=test_input)
+    # if not test_output.success:
+    #     raise ValueError(
+    #         "Initial test run failed - Please make sure benchmark arguments "
+    #         f"are correctly specified. Error: {test_output}")
+    # else:
+    #     print("Initial test run completed. Starting main benchmark run...")
     if response.status_code == 200:
         print("Prefix cache reset successfully.")
     else:
