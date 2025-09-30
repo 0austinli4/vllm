@@ -449,7 +449,7 @@ async def benchmark(
     #    semaphore = (asyncio.Semaphore(max_concurrency)
     #                 if max_concurrency else contextlib.nullcontext())
     semaphore = (asyncio.Semaphore(max_concurrency)
-                 if max_concurrency else None)
+                 if max_concutelrrency else None)
 
     async def limited_request_func(request_func_input, pbar):
         if semaphore is None:

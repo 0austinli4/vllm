@@ -98,6 +98,7 @@ def sample_sharegpt_requests(
     tokenizer: PreTrainedTokenizerBase,
     fixed_output_len: Optional[int] = None,
 ) -> list[tuple[str, int, int, None]]:
+    
     # Load the dataset.
     with open(dataset_path, encoding='utf-8') as f:
         dataset = json.load(f)
@@ -106,7 +107,6 @@ def sample_sharegpt_requests(
     # Only keep the first two turns of each conversation.
     dataset = [(data["conversations"][0]["value"],
                 data["conversations"][1]["value"]) for data in dataset]
-
     # Shuffle the dataset.
     random.shuffle(dataset)
 
@@ -121,17 +121,22 @@ def sample_sharegpt_requests(
         prompt_token_ids = tokenizer(prompt).input_ids
         completion = dataset[i][1]
         completion_token_ids = tokenizer(completion).input_ids
+        # print("Output len completion token ids", completion_token_ids)
         prompt_len = len(prompt_token_ids)
-        output_len = len(completion_token_ids
-                         ) if fixed_output_len is None else fixed_output_len
+        # AUSTIN: modify this to not cap reasoning
+        # 16,384
+        output_len = 4096
+        # len(completion_token_ids
+        #                  ) if fixed_output_len is None else fixed_output_len
         if prompt_len < 4 or (fixed_output_len is None and output_len < 4):
             # Prune too short sequences.
             continue
-        if prompt_len > 1024 or prompt_len + output_len > 2048:
-            # Prune too long sequences.
-            continue
+        # don't prune too long sequences
+        # if prompt_len > 1024 or prompt_len + output_len > 2048:
+        #     # Prune too long sequences.
+        #     continue
         filtered_dataset.append((prompt, prompt_len, output_len, None))
-
+    print("Share gpt filtered dataset len" , len(filtered_dataset))
     return filtered_dataset
 
 

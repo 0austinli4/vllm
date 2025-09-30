@@ -232,7 +232,7 @@ async def async_request_deepspeed_mii(
             pbar.update(1)
         return output
 
-
+# AUSTIN vllm serving: we're using this one
 async def async_request_openai_completions(
     request_func_input: RequestFuncInput,
     pbar: Optional[tqdm] = None,
@@ -241,7 +241,7 @@ async def async_request_openai_completions(
     assert api_url.endswith(
         ("completions", "profile")
     ), "OpenAI Completions API URL must end with 'completions' or 'profile'."
-
+    
     async with aiohttp.ClientSession(trust_env=True,
                                      timeout=AIOHTTP_TIMEOUT) as session:
         payload = {
@@ -258,6 +258,7 @@ async def async_request_openai_completions(
             },
         }
         if request_func_input.ignore_eos:
+            print("ignoring end of requence")
             payload["ignore_eos"] = request_func_input.ignore_eos
         if request_func_input.extra_body:
             payload.update(request_func_input.extra_body)
@@ -318,6 +319,7 @@ async def async_request_openai_completions(
                             "Never received a valid chunk to calculate TTFT."
                             "This response will be marked as failed!")
                     output.generated_text = generated_text
+                    # print("Generated text: ", output.generated_text)
                     output.latency = most_recent_timestamp - st
                 else:
                     output.error = response.reason or ""
