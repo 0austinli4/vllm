@@ -961,6 +961,8 @@ async def benchmark(
             "start_times": [output.start_time for output in outputs],
             "generated_texts": [output.generated_text for output in outputs],
             "errors": [output.error for output in outputs],
+            "finish_reasons": [output.finish_reason for output in outputs],
+            "stop_reasons": [output.stop_reason for output in outputs],
             "max_output_tokens_per_s": metrics.max_output_tokens_per_s,
             "max_concurrent_requests": metrics.max_concurrent_requests,
         }
@@ -1143,7 +1145,8 @@ def save_to_pytorch_benchmark_format(
     ]
     # These raw data might be useful, but they are rather big. They can be added
     # later if needed
-    ignored_metrics = ["ttfts", "itls", "generated_texts", "errors"]
+    ignored_metrics = ["ttfts", "itls", "generated_texts", "errors",
+                       "finish_reasons", "stop_reasons"]
     pt_records = convert_to_pytorch_benchmark_format(
         args=args,
         metrics={k: [results[k]] for k in metrics if k in results},
@@ -1731,6 +1734,8 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
             "itls",
             "generated_texts",
             "errors",
+            "finish_reasons",
+            "stop_reasons",
         ]:
             if field in result_json:
                 del result_json[field]

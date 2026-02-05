@@ -640,6 +640,12 @@ class OutputProcessor:
                 # if required.
                 req_state.logprobs_processor.update_from_output(engine_core_output)
 
+                # 3.5) Check confidence-based early exit
+                if finish_reason is None:
+                    if req_state.logprobs_processor.check_conf_stop():
+                        finish_reason = FinishReason.STOP
+                        stop_reason = "confidence_exit"
+
             # 4) Create and handle RequestOutput objects.
             if request_output := req_state.make_request_output(
                 new_token_ids,

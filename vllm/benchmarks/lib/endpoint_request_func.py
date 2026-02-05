@@ -93,6 +93,8 @@ class RequestFuncOutput:
     prompt_len: int = 0
     error: str = ""
     start_time: float = 0.0
+    finish_reason: str | None = None  # e.g., "stop", "length"
+    stop_reason: str | None = None  # e.g., "confidence_exit"
 
 
 class RequestFunc(Protocol):
@@ -212,7 +214,8 @@ async def async_request_openai_completions(
                             if choices := data.get("choices"):
                                 # Note that text could be empty here
                                 # e.g. for special tokens
-                                text = choices[0].get("text")
+                                choice = choices[0]
+                                text = choice.get("text")
                                 timestamp = time.perf_counter()
                                 # First token
                                 if not first_chunk_received:
@@ -226,6 +229,12 @@ async def async_request_openai_completions(
 
                                 most_recent_timestamp = timestamp
                                 generated_text += text or ""
+
+                                # Capture finish_reason and stop_reason
+                                if finish_reason := choice.get("finish_reason"):
+                                    output.finish_reason = finish_reason
+                                if stop_reason := choice.get("stop_reason"):
+                                    output.stop_reason = str(stop_reason)
                             elif usage := data.get("usage"):
                                 output.output_tokens = usage.get("completion_tokens")
                 if first_chunk_received:

@@ -2,8 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import itertools
+from collections import deque
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from vllm.logger import init_logger
 from vllm.logprobs import (
@@ -38,6 +39,18 @@ class LogprobsProcessor:
     num_logprobs: int | None
     num_prompt_logprobs: int | None
 
+    # Confidence exit tracking
+    conf_exit_enabled: bool = False
+    conf_sample_interval: int = 50
+    conf_window_size: int = 10
+    conf_min_tokens: int = 500
+    conf_min_samples: int = 5
+    conf_threshold: float = 15.0
+    conf_topk: int = 20
+    conf_samples: deque = field(default_factory=deque)
+    conf_total_tokens: int = 0
+    conf_should_stop: bool = False
+
     @classmethod
     def from_new_request(
         cls,
@@ -48,6 +61,26 @@ class LogprobsProcessor:
         assert sampling_params is not None
         num_logprobs = sampling_params.logprobs
         num_prompt_logprobs = sampling_params.prompt_logprobs
+
+        # Extract confidence exit parameters from extra_args
+        extra_args = sampling_params.extra_args or {}
+        conf_exit_enabled = extra_args.get("enable_conf_exit", False)
+        conf_sample_interval = extra_args.get("sample_interval", 50)
+        conf_window_size = extra_args.get("window_size", 10)
+        conf_min_tokens = extra_args.get("min_tokens", 500)
+        conf_min_samples = extra_args.get("min_samples", 5)
+        conf_threshold = extra_args.get("conf_threshold", 15.0)
+        conf_topk = extra_args.get("conf_topk", 20)
+
+        # Validate that logprobs >= conf_topk when confidence exit is enabled
+        if conf_exit_enabled:
+            if num_logprobs is None or num_logprobs < conf_topk:
+                raise ValueError(
+                    f"Confidence-based early exit requires logprobs >= conf_topk. "
+                    f"Got logprobs={num_logprobs}, conf_topk={conf_topk}. "
+                    f"Set logprobs={conf_topk} or higher in SamplingParams."
+                )
+
         return cls(
             tokenizer=tokenizer,
             cumulative_logprob=(None if num_logprobs is None else 0.0),
@@ -63,6 +96,16 @@ class LogprobsProcessor:
             ),
             num_prompt_logprobs=num_prompt_logprobs,
             num_logprobs=num_logprobs,
+            conf_exit_enabled=conf_exit_enabled,
+            conf_sample_interval=conf_sample_interval,
+            conf_window_size=conf_window_size,
+            conf_min_tokens=conf_min_tokens,
+            conf_min_samples=conf_min_samples,
+            conf_threshold=conf_threshold,
+            conf_topk=conf_topk,
+            conf_samples=deque(),
+            conf_total_tokens=0,
+            conf_should_stop=False,
         )
 
     def _update_sample_logprobs(self, logprobs_lists: LogprobsLists) -> None:
@@ -113,6 +156,10 @@ class LogprobsProcessor:
                 rank,
                 self.num_logprobs,
             )
+
+            # Update confidence tracking if enabled
+            if self.conf_exit_enabled:
+                self._update_confidence_sample(logprobs)
 
     def _update_prompt_logprobs(
         self,
@@ -243,3 +290,57 @@ class LogprobsProcessor:
             self._update_sample_logprobs(output.new_logprobs)
         if output.new_prompt_logprobs_tensors is not None:
             self._update_prompt_logprobs(output.new_prompt_logprobs_tensors)
+
+    def _update_confidence_sample(self, logprobs: list[float]) -> None:
+        """Update confidence tracking with a new token's logprobs.
+
+        Args:
+            logprobs: List of top-k logprobs for this token position,
+                     sorted by rank (sampled token first at index 0).
+        """
+        self.conf_total_tokens += 1
+
+        # Only compute at the sampling interval
+        if self.conf_total_tokens % self.conf_sample_interval != 0:
+            return
+
+        # Compute confidence as negative mean of top-k logprobs
+        # Higher confidence = more negative logprobs = model is more certain
+        topk_logprobs = logprobs[: self.conf_topk]
+        confidence = -sum(topk_logprobs) / len(topk_logprobs)
+
+        # Append to rolling window
+        self.conf_samples.append(confidence)
+
+        # Pop oldest if window is full
+        if len(self.conf_samples) > self.conf_window_size:
+            self.conf_samples.popleft()
+
+    def check_conf_stop(self) -> bool:
+        """Check if confidence-based early exit should trigger.
+
+        Returns:
+            True if the request should stop due to high confidence,
+            False otherwise.
+        """
+        # Not enabled or already triggered
+        if not self.conf_exit_enabled or self.conf_should_stop:
+            return False
+
+        # Not enough tokens generated yet
+        if self.conf_total_tokens < self.conf_min_tokens:
+            return False
+
+        # Not enough samples collected yet
+        if len(self.conf_samples) < self.conf_min_samples:
+            return False
+
+        # Compute rolling average
+        avg_confidence = sum(self.conf_samples) / len(self.conf_samples)
+
+        # Check threshold
+        if avg_confidence > self.conf_threshold:
+            self.conf_should_stop = True
+            return True
+
+        return False
