@@ -77,6 +77,11 @@ class RequestFuncInput:
     ignore_eos: bool = False
     language: str | None = None
     request_id: str | None = None
+    # Answer extraction settings (for confidence-based early exit)
+    enable_answer_extraction: bool = False
+    extraction_prompt: str = "\n\nFinal Answer:\n\\boxed{"
+    extraction_stop: str = "}"
+    extraction_max_tokens: int = 150
 
 
 @dataclass
@@ -95,6 +100,11 @@ class RequestFuncOutput:
     start_time: float = 0.0
     finish_reason: str | None = None  # e.g., "stop", "length"
     stop_reason: str | None = None  # e.g., "confidence_exit"
+    # Answer extraction fields
+    answer_extracted: bool = False  # True if extraction was performed
+    extracted_answer: str = ""  # The extracted answer (content inside \boxed{})
+    extraction_latency: float = 0.0  # Latency of the extraction phase
+    pre_extraction_tokens: int = 0  # Tokens generated before extraction
 
 
 class RequestFunc(Protocol):
@@ -138,6 +148,82 @@ def _update_headers_common(
         headers |= request_func_input.extra_headers
     if request_func_input.request_id:
         headers["x-request-id"] = request_func_input.request_id
+
+
+async def _do_extraction_request(
+    request_func_input: RequestFuncInput,
+    session: aiohttp.ClientSession,
+    generated_text: str,
+    headers: dict,
+) -> tuple[str, float, int]:
+    """Perform the answer extraction follow-up request.
+
+    Args:
+        request_func_input: Original request input
+        session: aiohttp session
+        generated_text: Text generated before extraction trigger
+        headers: HTTP headers to use
+
+    Returns:
+        Tuple of (extracted_text, latency, output_tokens)
+    """
+    # Build extraction prompt: original prompt + generated text + inducing prompt
+    extraction_full_prompt = (
+        request_func_input.prompt + generated_text +
+        request_func_input.extraction_prompt
+    )
+
+    # Build extraction payload - disable confidence exit for this request
+    extraction_extra_body = dict(request_func_input.extra_body or {})
+    if "vllm_xargs" in extraction_extra_body:
+        extraction_extra_body["vllm_xargs"] = dict(extraction_extra_body["vllm_xargs"])
+        extraction_extra_body["vllm_xargs"]["enable_conf_exit"] = False
+
+    payload = {
+        "model": request_func_input.model_name
+        if request_func_input.model_name
+        else request_func_input.model,
+        "prompt": extraction_full_prompt,
+        "max_tokens": request_func_input.extraction_max_tokens,
+        "stop": [request_func_input.extraction_stop],
+        "stream": True,
+        "stream_options": {"include_usage": True},
+    }
+    if extraction_extra_body:
+        payload.update(extraction_extra_body)
+
+    extracted_text = ""
+    output_tokens = 0
+    st = time.perf_counter()
+
+    try:
+        async with session.post(
+            url=request_func_input.api_url, json=payload, headers=headers
+        ) as response:
+            if response.status == 200:
+                handler = StreamedResponseHandler()
+                async for chunk_bytes in response.content.iter_any():
+                    chunk_bytes = chunk_bytes.strip()
+                    if not chunk_bytes:
+                        continue
+
+                    messages = handler.add_chunk(chunk_bytes)
+                    for message in messages:
+                        if message.startswith(":"):
+                            continue
+                        chunk = message.removeprefix("data: ")
+                        if chunk != "[DONE]":
+                            data = json.loads(chunk)
+                            if choices := data.get("choices"):
+                                text = choices[0].get("text")
+                                extracted_text += text or ""
+                            elif usage := data.get("usage"):
+                                output_tokens = usage.get("completion_tokens", 0)
+    except Exception:
+        pass  # Extraction failure is not fatal
+
+    latency = time.perf_counter() - st
+    return extracted_text, latency, output_tokens
 
 
 async def async_request_openai_completions(
@@ -254,6 +340,39 @@ async def async_request_openai_completions(
         output.success = False
         exc_info = sys.exc_info()
         output.error = "".join(traceback.format_exception(*exc_info))
+
+    # Handle answer extraction if confidence exit triggered
+    if (
+        output.success
+        and output.stop_reason == "confidence_exit"
+        and request_func_input.enable_answer_extraction
+    ):
+        output.pre_extraction_tokens = output.output_tokens
+
+        # Perform extraction request
+        extracted_text, extraction_latency, extraction_tokens = (
+            await _do_extraction_request(
+                request_func_input, session, generated_text, headers
+            )
+        )
+
+        if extracted_text:
+            output.answer_extracted = True
+            output.extracted_answer = extracted_text.rstrip(
+                request_func_input.extraction_stop
+            )
+            output.extraction_latency = extraction_latency
+            output.output_tokens += extraction_tokens
+            output.latency += extraction_latency
+
+            # Append extraction to generated text
+            output.generated_text = (
+                generated_text +
+                request_func_input.extraction_prompt +
+                extracted_text
+            )
+            # Update stop reason to indicate extraction was done
+            output.stop_reason = "confidence_exit_extracted"
 
     if pbar:
         pbar.update(1)

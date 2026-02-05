@@ -615,6 +615,11 @@ async def benchmark(
     ramp_up_start_rps: int | None = None,
     ramp_up_end_rps: int | None = None,
     ready_check_timeout_sec: int = 600,
+    # Answer extraction parameters
+    enable_answer_extraction: bool = False,
+    extraction_prompt: str = "\n\nFinal Answer:\n\\boxed{",
+    extraction_stop: str = "}",
+    extraction_max_tokens: int = 150,
 ):
     try:
         request_func = ASYNC_REQUEST_FUNCS[endpoint_type]
@@ -825,6 +830,10 @@ async def benchmark(
             extra_headers=extra_headers,
             extra_body=extra_body,
             request_id=request_id,
+            enable_answer_extraction=enable_answer_extraction,
+            extraction_prompt=extraction_prompt,
+            extraction_stop=extraction_stop,
+            extraction_max_tokens=extraction_max_tokens,
         )
         tasks.append(
             asyncio.create_task(
@@ -954,6 +963,7 @@ async def benchmark(
             "request_goodput": metrics.request_goodput if goodput_config_dict else None,
             "output_throughput": metrics.output_throughput,
             "total_token_throughput": metrics.total_token_throughput,
+            "prompts": [req.prompt for req in input_requests],
             "input_lens": [output.prompt_len for output in outputs],
             "output_lens": actual_output_lens,
             "ttfts": [output.ttft for output in outputs],
@@ -963,6 +973,10 @@ async def benchmark(
             "errors": [output.error for output in outputs],
             "finish_reasons": [output.finish_reason for output in outputs],
             "stop_reasons": [output.stop_reason for output in outputs],
+            "answer_extracted": [output.answer_extracted for output in outputs],
+            "extracted_answers": [output.extracted_answer for output in outputs],
+            "extraction_latencies": [output.extraction_latency for output in outputs],
+            "pre_extraction_tokens": [output.pre_extraction_tokens for output in outputs],
             "max_output_tokens_per_s": metrics.max_output_tokens_per_s,
             "max_concurrent_requests": metrics.max_concurrent_requests,
         }
@@ -1145,8 +1159,10 @@ def save_to_pytorch_benchmark_format(
     ]
     # These raw data might be useful, but they are rather big. They can be added
     # later if needed
-    ignored_metrics = ["ttfts", "itls", "generated_texts", "errors",
-                       "finish_reasons", "stop_reasons"]
+    ignored_metrics = ["prompts", "ttfts", "itls", "generated_texts", "errors",
+                       "finish_reasons", "stop_reasons", "answer_extracted",
+                       "extracted_answers", "extraction_latencies",
+                       "pre_extraction_tokens"]
     pt_records = convert_to_pytorch_benchmark_format(
         args=args,
         metrics={k: [results[k]] for k in metrics if k in results},
@@ -1505,6 +1521,33 @@ def add_cli_args(parser: argparse.ArgumentParser):
         default=None,
     )
 
+    # Answer extraction arguments (for confidence-based early exit)
+    extraction_group = parser.add_argument_group("answer extraction parameters")
+    extraction_group.add_argument(
+        "--enable-answer-extraction",
+        action="store_true",
+        help="Enable answer extraction when confidence-based early exit triggers. "
+        "When enabled, an inducing prompt is appended to extract the final answer.",
+    )
+    extraction_group.add_argument(
+        "--extraction-prompt",
+        type=str,
+        default="\n\nFinal Answer:\n\\boxed{",
+        help="The prompt to append for answer extraction (default: '\\n\\nFinal Answer:\\n\\\\boxed{').",
+    )
+    extraction_group.add_argument(
+        "--extraction-stop",
+        type=str,
+        default="}",
+        help="Stop string for answer extraction (default: '}').",
+    )
+    extraction_group.add_argument(
+        "--extraction-max-tokens",
+        type=int,
+        default=150,
+        help="Maximum tokens for the extraction phase (default: 150).",
+    )
+
 
 def main(args: argparse.Namespace) -> dict[str, Any]:
     return asyncio.run(main_async(args))
@@ -1683,6 +1726,10 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
         ramp_up_start_rps=args.ramp_up_start_rps,
         ramp_up_end_rps=args.ramp_up_end_rps,
         ready_check_timeout_sec=args.ready_check_timeout_sec,
+        enable_answer_extraction=args.enable_answer_extraction,
+        extraction_prompt=args.extraction_prompt,
+        extraction_stop=args.extraction_stop,
+        extraction_max_tokens=args.extraction_max_tokens,
     )
 
     # Save config and results to json
@@ -1727,6 +1774,7 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
     if not args.save_detailed:
         # Remove fields with too many data points
         for field in [
+            "prompts",
             "input_lens",
             "output_lens",
             "start_times",
@@ -1736,6 +1784,10 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
             "errors",
             "finish_reasons",
             "stop_reasons",
+            "answer_extracted",
+            "extracted_answers",
+            "extraction_latencies",
+            "pre_extraction_tokens",
         ]:
             if field in result_json:
                 del result_json[field]
