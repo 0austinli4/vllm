@@ -41,15 +41,16 @@ class LogprobsProcessor:
 
     # Confidence exit tracking
     conf_exit_enabled: bool = False
-    conf_sample_interval: int = 50
-    conf_window_size: int = 10
-    conf_min_tokens: int = 500
-    conf_min_samples: int = 5
-    conf_threshold: float = 15.0
-    conf_topk: int = 20
+    conf_sample_interval: int = 24
+    conf_window_size: int = 5
+    conf_min_tokens: int = 50
+    conf_min_samples: int = 3
+    conf_threshold: float = 12.0
+    conf_topk: int = 10
     conf_samples: deque = field(default_factory=deque)
     conf_total_tokens: int = 0
     conf_should_stop: bool = False
+    conf_history: list = field(default_factory=list)  # [(total_tokens, avg_confidence)]
 
     @classmethod
     def from_new_request(
@@ -65,12 +66,12 @@ class LogprobsProcessor:
         # Extract confidence exit parameters from extra_args
         extra_args = sampling_params.extra_args or {}
         conf_exit_enabled = extra_args.get("enable_conf_exit", False)
-        conf_sample_interval = extra_args.get("sample_interval", 50)
-        conf_window_size = extra_args.get("window_size", 10)
-        conf_min_tokens = extra_args.get("min_tokens", 500)
-        conf_min_samples = extra_args.get("min_samples", 5)
-        conf_threshold = extra_args.get("conf_threshold", 15.0)
-        conf_topk = extra_args.get("conf_topk", 20)
+        conf_sample_interval = extra_args.get("sample_interval", 24)
+        conf_window_size = extra_args.get("window_size", 5)
+        conf_min_tokens = extra_args.get("min_tokens", 50)
+        conf_min_samples = extra_args.get("min_samples", 3)
+        conf_threshold = extra_args.get("conf_threshold", 12.0)
+        conf_topk = extra_args.get("conf_topk", 10)
 
         # Validate that logprobs >= conf_topk when confidence exit is enabled
         if conf_exit_enabled:
@@ -106,6 +107,7 @@ class LogprobsProcessor:
             conf_samples=deque(),
             conf_total_tokens=0,
             conf_should_stop=False,
+            conf_history=[],
         )
 
     def _update_sample_logprobs(self, logprobs_lists: LogprobsLists) -> None:
@@ -316,8 +318,18 @@ class LogprobsProcessor:
         if len(self.conf_samples) > self.conf_window_size:
             self.conf_samples.popleft()
 
+        # Record history for offline analysis
+        if len(self.conf_samples) >= self.conf_min_samples:
+            avg = sum(self.conf_samples) / len(self.conf_samples)
+            self.conf_history.append((self.conf_total_tokens, avg))
+
     def check_conf_stop(self) -> bool:
         """Check if confidence-based early exit should trigger.
+
+        Requires both:
+        1. Rolling average confidence exceeds the threshold
+        2. Confidence is trending upward (not a random spike) —
+           the most recent sample must be >= the oldest sample in the window
 
         Returns:
             True if the request should stop due to high confidence,
@@ -338,9 +350,12 @@ class LogprobsProcessor:
         # Compute rolling average
         avg_confidence = sum(self.conf_samples) / len(self.conf_samples)
 
-        # Check threshold
+        # Check threshold + directional: confidence must be above threshold
+        # AND trending upward (latest >= oldest in window) to avoid
+        # triggering on transient spikes that are already declining
         if avg_confidence > self.conf_threshold:
-            self.conf_should_stop = True
-            return True
+            if self.conf_samples[-1] >= self.conf_samples[0]:
+                self.conf_should_stop = True
+                return True
 
         return False

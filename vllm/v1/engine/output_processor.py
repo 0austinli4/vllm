@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import asyncio
+import json
+import os
 from collections import defaultdict, deque
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -674,6 +676,20 @@ class OutputProcessor:
                     else:
                         req_state.input_chunk_queue = None
                 else:
+                    # Dump confidence history to JSONL if enabled
+                    if (req_state.logprobs_processor is not None
+                            and req_state.logprobs_processor.conf_history):
+                        conf_log_dir = os.environ.get("CONF_LOG_DIR", "")
+                        if conf_log_dir:
+                            os.makedirs(conf_log_dir, exist_ok=True)
+                            history_entry = {
+                                "request_id": req_state.external_req_id,
+                                "conf_threshold": req_state.logprobs_processor.conf_threshold,
+                                "history": req_state.logprobs_processor.conf_history,
+                            }
+                            with open(os.path.join(conf_log_dir, "conf_history.jsonl"), "a") as f:
+                                f.write(json.dumps(history_entry) + "\n")
+
                     self._finish_request(req_state)
                     if not engine_core_output.finished:
                         # If req not finished in EngineCore, but Detokenizer

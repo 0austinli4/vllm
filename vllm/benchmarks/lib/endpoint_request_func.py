@@ -188,6 +188,7 @@ async def _do_extraction_request(
         "stop": [request_func_input.extraction_stop],
         "stream": True,
         "stream_options": {"include_usage": True},
+        "priority": -1,
     }
     if extraction_extra_body:
         payload.update(extraction_extra_body)
