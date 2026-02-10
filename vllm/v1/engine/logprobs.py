@@ -47,8 +47,11 @@ class LogprobsProcessor:
     conf_min_samples: int = 3
     conf_threshold: float = 12.0
     conf_topk: int = 10
+    conf_rise_ratio: float = 1.5
     conf_samples: deque = field(default_factory=deque)
     conf_total_tokens: int = 0
+    conf_cumulative_sum: float = 0.0
+    conf_cumulative_count: int = 0
     conf_should_stop: bool = False
     conf_history: list = field(default_factory=list)  # [(total_tokens, avg_confidence)]
 
@@ -72,6 +75,7 @@ class LogprobsProcessor:
         conf_min_samples = extra_args.get("min_samples", 3)
         conf_threshold = extra_args.get("conf_threshold", 12.0)
         conf_topk = extra_args.get("conf_topk", 10)
+        conf_rise_ratio = extra_args.get("conf_rise_ratio", 1.5)
 
         # Validate that logprobs >= conf_topk when confidence exit is enabled
         if conf_exit_enabled:
@@ -104,8 +108,11 @@ class LogprobsProcessor:
             conf_min_samples=conf_min_samples,
             conf_threshold=conf_threshold,
             conf_topk=conf_topk,
+            conf_rise_ratio=conf_rise_ratio,
             conf_samples=deque(),
             conf_total_tokens=0,
+            conf_cumulative_sum=0.0,
+            conf_cumulative_count=0,
             conf_should_stop=False,
             conf_history=[],
         )
@@ -311,6 +318,10 @@ class LogprobsProcessor:
         topk_logprobs = logprobs[: self.conf_topk]
         confidence = -sum(topk_logprobs) / len(topk_logprobs)
 
+        # Track cumulative stats for rise-over-mean
+        self.conf_cumulative_sum += confidence
+        self.conf_cumulative_count += 1
+
         # Append to rolling window
         self.conf_samples.append(confidence)
 
@@ -326,10 +337,12 @@ class LogprobsProcessor:
     def check_conf_stop(self) -> bool:
         """Check if confidence-based early exit should trigger.
 
-        Requires both:
-        1. Rolling average confidence exceeds the threshold
-        2. Confidence is trending upward (not a random spike) —
-           the most recent sample must be >= the oldest sample in the window
+        Exit if EITHER condition is met (plus directional check):
+        1. Rolling window average exceeds the fixed threshold, OR
+        2. Rolling window average / cumulative average >= rise_ratio
+           (adaptive: recent confidence has risen significantly
+           above this request's own baseline)
+        Both paths require confidence trending upward (directional).
 
         Returns:
             True if the request should stop due to high confidence,
@@ -347,15 +360,22 @@ class LogprobsProcessor:
         if len(self.conf_samples) < self.conf_min_samples:
             return False
 
-        # Compute rolling average
-        avg_confidence = sum(self.conf_samples) / len(self.conf_samples)
+        # Compute rolling window average
+        window_avg = sum(self.conf_samples) / len(self.conf_samples)
 
-        # Check threshold + directional: confidence must be above threshold
-        # AND trending upward (latest >= oldest in window) to avoid
-        # triggering on transient spikes that are already declining
-        if avg_confidence > self.conf_threshold:
-            if self.conf_samples[-1] >= self.conf_samples[0]:
-                self.conf_should_stop = True
-                return True
+        # Check either exit condition
+        threshold_met = window_avg > self.conf_threshold
 
-        return False
+        cumulative_avg = self.conf_cumulative_sum / self.conf_cumulative_count
+        rise_met = (cumulative_avg > 0
+                    and window_avg / cumulative_avg >= self.conf_rise_ratio)
+
+        if not (threshold_met or rise_met):
+            return False
+
+        # Directional check: latest >= oldest in window
+        if self.conf_samples[-1] < self.conf_samples[0]:
+            return False
+
+        self.conf_should_stop = True
+        return True
