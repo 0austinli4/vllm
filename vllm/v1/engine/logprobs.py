@@ -41,10 +41,11 @@ class LogprobsProcessor:
 
     # Confidence exit tracking
     conf_exit_enabled: bool = False
-    conf_sample_interval: int = 24
-    conf_window_size: int = 5
+    conf_method: str = "window"  # "window" or "ema"
+    conf_window_size: int = 120
+    conf_ema_alpha: float = 0.01
+    conf_ema_value: float = 0.0
     conf_min_tokens: int = 50
-    conf_min_samples: int = 3
     conf_threshold: float = 12.0
     conf_topk: int = 10
     conf_rise_ratio: float = 1.5
@@ -69,10 +70,10 @@ class LogprobsProcessor:
         # Extract confidence exit parameters from extra_args
         extra_args = sampling_params.extra_args or {}
         conf_exit_enabled = extra_args.get("enable_conf_exit", False)
-        conf_sample_interval = extra_args.get("sample_interval", 24)
-        conf_window_size = extra_args.get("window_size", 5)
+        conf_method = extra_args.get("conf_method", "window")
+        conf_window_size = extra_args.get("window_size", 2048)
+        conf_ema_alpha = extra_args.get("conf_ema_alpha", 0.01)
         conf_min_tokens = extra_args.get("min_tokens", 50)
-        conf_min_samples = extra_args.get("min_samples", 3)
         conf_threshold = extra_args.get("conf_threshold", 12.0)
         conf_topk = extra_args.get("conf_topk", 10)
         conf_rise_ratio = extra_args.get("conf_rise_ratio", 1.5)
@@ -102,10 +103,11 @@ class LogprobsProcessor:
             num_prompt_logprobs=num_prompt_logprobs,
             num_logprobs=num_logprobs,
             conf_exit_enabled=conf_exit_enabled,
-            conf_sample_interval=conf_sample_interval,
+            conf_method=conf_method,
             conf_window_size=conf_window_size,
+            conf_ema_alpha=conf_ema_alpha,
+            conf_ema_value=0.0,
             conf_min_tokens=conf_min_tokens,
-            conf_min_samples=conf_min_samples,
             conf_threshold=conf_threshold,
             conf_topk=conf_topk,
             conf_rise_ratio=conf_rise_ratio,
@@ -303,18 +305,17 @@ class LogprobsProcessor:
     def _update_confidence_sample(self, logprobs: list[float]) -> None:
         """Update confidence tracking with a new token's logprobs.
 
+        Two methods:
+        - "window": sliding window average over last conf_window_size tokens
+        - "ema": exponential moving average, conf = (1-alpha)*conf + alpha*new
+
         Args:
             logprobs: List of top-k logprobs for this token position,
                      sorted by rank (sampled token first at index 0).
         """
         self.conf_total_tokens += 1
 
-        # Only compute at the sampling interval
-        if self.conf_total_tokens % self.conf_sample_interval != 0:
-            return
-
         # Compute confidence as negative mean of top-k logprobs
-        # Higher confidence = more negative logprobs = model is more certain
         topk_logprobs = logprobs[: self.conf_topk]
         confidence = -sum(topk_logprobs) / len(topk_logprobs)
 
@@ -322,17 +323,27 @@ class LogprobsProcessor:
         self.conf_cumulative_sum += confidence
         self.conf_cumulative_count += 1
 
-        # Append to rolling window
-        self.conf_samples.append(confidence)
+        if self.conf_method == "ema":
+            # EMA: updated every token
+            if self.conf_total_tokens == 1:
+                self.conf_ema_value = confidence
+            else:
+                self.conf_ema_value = ((1 - self.conf_ema_alpha) * self.conf_ema_value
+                                       + self.conf_ema_alpha * confidence)
 
-        # Pop oldest if window is full
-        if len(self.conf_samples) > self.conf_window_size:
-            self.conf_samples.popleft()
+            # Record history every 24 tokens
+            if self.conf_total_tokens % 24 == 0:
+                self.conf_history.append((self.conf_total_tokens, self.conf_ema_value))
+        else:
+            # Sliding window method
+            self.conf_samples.append(confidence)
+            if len(self.conf_samples) > self.conf_window_size:
+                self.conf_samples.popleft()
 
-        # Record history for offline analysis
-        if len(self.conf_samples) >= self.conf_min_samples:
-            avg = sum(self.conf_samples) / len(self.conf_samples)
-            self.conf_history.append((self.conf_total_tokens, avg))
+            # Record history every 24 tokens
+            if self.conf_total_tokens % 24 == 0:
+                avg = sum(self.conf_samples) / len(self.conf_samples)
+                self.conf_history.append((self.conf_total_tokens, avg))
 
     def check_conf_stop(self) -> bool:
         """Check if confidence-based early exit should trigger.
@@ -356,25 +367,24 @@ class LogprobsProcessor:
         if self.conf_total_tokens < self.conf_min_tokens:
             return False
 
-        # Not enough samples collected yet
-        if len(self.conf_samples) < self.conf_min_samples:
-            return False
-
-        # Compute rolling window average
-        window_avg = sum(self.conf_samples) / len(self.conf_samples)
+        # Get current confidence estimate based on method
+        if self.conf_method == "ema":
+            current_conf = self.conf_ema_value
+        else:
+            current_conf = sum(self.conf_samples) / len(self.conf_samples)
 
         # Check either exit condition
-        threshold_met = window_avg > self.conf_threshold
+        threshold_met = current_conf > self.conf_threshold
 
         cumulative_avg = self.conf_cumulative_sum / self.conf_cumulative_count
         rise_met = (cumulative_avg > 0
-                    and window_avg / cumulative_avg >= self.conf_rise_ratio)
+                    and current_conf / cumulative_avg >= self.conf_rise_ratio)
 
         if not (threshold_met or rise_met):
             return False
 
-        # Directional check: latest >= oldest in window
-        if self.conf_samples[-1] < self.conf_samples[0]:
+        # Directional check (only for window mode where we have samples)
+        if self.conf_method != "ema" and self.conf_samples[-1] < self.conf_samples[0]:
             return False
 
         self.conf_should_stop = True
