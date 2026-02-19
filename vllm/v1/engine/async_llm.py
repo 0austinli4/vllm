@@ -677,6 +677,13 @@ class AsyncLLM(EngineClient):
                                 processed_outputs.reqs_to_abort
                             )
 
+                        # 3.5) Submit probe requests spawned this iteration.
+                        for probe_req in processed_outputs.new_probe_requests:
+                            logger.debug("PROBE_SUBMIT: submitting probe %s to engine",
+                                         probe_req.request_id)
+                            output_processor.add_request(probe_req, None, None, 0)
+                            await engine_core.add_request_async(probe_req)
+
                     output_processor.update_scheduler_stats(outputs.scheduler_stats)
 
                     # 4) Logging.

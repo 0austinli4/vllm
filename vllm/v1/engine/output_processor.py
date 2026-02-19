@@ -4,9 +4,10 @@
 import asyncio
 import json
 import os
+import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, cast
 
 import numpy as np
@@ -20,13 +21,16 @@ from vllm.outputs import (
     PoolingRequestOutput,
     RequestOutput,
 )
-from vllm.sampling_params import RequestOutputKind
+from vllm.sampling_params import RequestOutputKind, SamplingParams
 from vllm.tokenizers import TokenizerLike
 from vllm.tracing import SpanAttributes, SpanKind, Tracer, extract_trace_context
 from vllm.utils import length_from_prompt_token_ids_or_embeds
 from vllm.v1.engine import EngineCoreOutput, EngineCoreRequest, FinishReason
 from vllm.v1.engine.detokenizer import IncrementalDetokenizer
+from vllm.logger import init_logger
 from vllm.v1.engine.logprobs import LogprobsProcessor
+
+logger = init_logger(__name__)
 from vllm.v1.engine.parallel_sampling import ParentRequest
 from vllm.v1.metrics.stats import (
     IterationStats,
@@ -107,6 +111,7 @@ class RequestOutputCollector:
 class OutputProcessorOutput:
     request_outputs: list[RequestOutput | PoolingRequestOutput]
     reqs_to_abort: list[str]
+    new_probe_requests: list[EngineCoreRequest] = field(default_factory=list)
 
 
 @dataclass
@@ -146,6 +151,8 @@ class RequestState:
         n: int | None = None,
         temperature: float | None = None,
         stream_input: bool = False,
+        is_probe: bool = False,
+        parent_req_id: str | None = None,
     ):
         self.request_id = request_id
         self.external_req_id = external_req_id
@@ -171,6 +178,7 @@ class RequestState:
         self.num_cached_tokens = 0
 
         self.stats = RequestStateStats(arrival_time=arrival_time) if log_stats else None
+        self.arrival_time: float = arrival_time
 
         # Stream Interval
         self.stream_interval = stream_interval
@@ -181,6 +189,10 @@ class RequestState:
         self.input_chunk_queue: deque[StreamingUpdate] | None = (
             deque() if stream_input else None
         )
+
+        # Probe identification
+        self.is_probe = is_probe
+        self.parent_req_id = parent_req_id
 
     def apply_streaming_update(self, update: StreamingUpdate) -> None:
         # Apply the update to the request state.
@@ -229,6 +241,9 @@ class RequestState:
             top_p = sampling_params.top_p
             n = sampling_params.n
             temperature = sampling_params.temperature
+            extra_args = sampling_params.extra_args or {}
+            is_probe = bool(extra_args.get("_is_probe", False))
+            parent_req_id = extra_args.get("_parent_req_id", None)
         else:
             logprobs_processor = None
             detokenizer = None
@@ -236,6 +251,8 @@ class RequestState:
             top_p = None
             n = None
             temperature = None
+            is_probe = False
+            parent_req_id = None
             assert request.pooling_params is not None
             output_kind = request.pooling_params.output_kind
 
@@ -261,6 +278,8 @@ class RequestState:
             log_stats=log_stats,
             stream_interval=stream_interval,
             stream_input=request.resumable,
+            is_probe=is_probe,
+            parent_req_id=parent_req_id,
         )
 
     def make_request_output(
@@ -606,6 +625,7 @@ class OutputProcessor:
 
         request_outputs: list[RequestOutput | PoolingRequestOutput] = []
         reqs_to_abort: list[str] = []
+        new_probe_requests: list[EngineCoreRequest] = []
         for engine_core_output in engine_core_outputs:
             req_id = engine_core_output.request_id
             req_state = self.request_states.get(req_id)
@@ -642,11 +662,51 @@ class OutputProcessor:
                 # if required.
                 req_state.logprobs_processor.update_from_output(engine_core_output)
 
-                # 3.5) Check confidence-based early exit
+                # 3.5) Probe stability exit (with SLO-aware K adjustment)
                 if finish_reason is None:
-                    if req_state.logprobs_processor.check_conf_stop():
+                    lp = req_state.logprobs_processor
+                    if lp is not None and lp.slo_latency_ms is not None:
+                        elapsed_ms = (time.time() - req_state.arrival_time) * 1000
+                        lp.probe_stability_n = lp.slo_adjusted_k(elapsed_ms)
+                    if lp is not None and lp.probe_should_stop:
                         finish_reason = FinishReason.STOP
-                        stop_reason = "confidence_exit"
+                        # Encode active K in stop_reason for observability
+                        stop_reason = f"answer_stable_k{lp.probe_stability_n}"
+                        # Append stable answer so verifiers can extract it
+                        stable_answer = lp.probe_stable_answer
+                        if stable_answer and req_state.detokenizer is not None:
+                            req_state.detokenizer.output_text += (
+                                f"\n\nFinal Answer:\n\\boxed{{{stable_answer}}}"
+                            )
+
+                # 3.6) Spawn a probe if at 24-token boundary
+                lp_proc = req_state.logprobs_processor
+                if not req_state.is_probe and lp_proc is not None:
+                    lp_proc.increment_output_tokens(len(new_token_ids))
+                if (finish_reason is None
+                        and not req_state.is_probe
+                        and req_state.logprobs_processor.check_probe_trigger()):
+                    probe_req = self._build_probe_request(req_state)
+                    new_probe_requests.append(probe_req)
+                    req_state.logprobs_processor.mark_probe_pending()
+                    logger.debug("PROBE_SPAWN: req=%s tokens=%d probe_id=%s",
+                                 req_id, lp_proc.output_token_count, probe_req.request_id)
+
+            # 3.7) Route completed probe to parent (skip normal output handling)
+            if req_state.is_probe:
+                if finish_reason is not None:
+                    answer = req_state.detokenizer.output_text if req_state.detokenizer else None
+                    parent_state = self.request_states.get(req_state.parent_req_id)
+                    if (parent_state is not None
+                            and parent_state.logprobs_processor is not None):
+                        parent_state.logprobs_processor.record_probe_result(
+                            answer or None
+                        )
+                    self._finish_request(req_state)
+                    if not engine_core_output.finished:
+                        # Detokenizer detected stop before engine core; abort in engine.
+                        reqs_to_abort.append(req_id)
+                continue  # probes never produce output
 
             # 4) Create and handle RequestOutput objects.
             if request_output := req_state.make_request_output(
@@ -706,6 +766,54 @@ class OutputProcessor:
         return OutputProcessorOutput(
             request_outputs=request_outputs,
             reqs_to_abort=reqs_to_abort,
+            new_probe_requests=new_probe_requests,
+        )
+
+    def _build_probe_request(self, req_state: RequestState) -> EngineCoreRequest:
+        """Build a high-priority extraction probe for req_state."""
+        lp = req_state.logprobs_processor
+        assert lp is not None
+        assert req_state.detokenizer is not None
+
+        # Build prompt token IDs: original prompt + generated so far + extraction prompt
+        extraction_prompt_ids = (
+            self.tokenizer.encode(lp.probe_extraction_prompt, add_special_tokens=False)
+            if self.tokenizer else []
+        )
+        probe_token_ids = (
+            list(req_state.prompt_token_ids or [])
+            + list(req_state.detokenizer.output_token_ids)
+            + extraction_prompt_ids
+        )
+        probe_req_id = f"probe-{req_state.request_id}-{lp.output_token_count}"
+        sampling = SamplingParams(
+            max_tokens=lp.probe_extraction_max_tokens,
+            stop=[lp.probe_extraction_stop],
+            temperature=0.0,
+            extra_args={
+                "_is_probe": True,
+                "_parent_req_id": req_state.request_id,
+                "enable_answer_stability": False,
+            },
+        )
+        eos_token_id = (
+            self.tokenizer.eos_token_id
+            if self.tokenizer and hasattr(self.tokenizer, "eos_token_id")
+            else None
+        )
+        return EngineCoreRequest(
+            request_id=probe_req_id,
+            prompt_token_ids=probe_token_ids,
+            mm_features=None,
+            sampling_params=sampling,
+            pooling_params=None,
+            eos_token_id=eos_token_id,
+            arrival_time=time.time(),
+            lora_request=None,
+            cache_salt=None,
+            data_parallel_rank=None,
+            priority=-1,
+            external_req_id=probe_req_id,
         )
 
     def _finish_request(self, req_state: RequestState) -> None:

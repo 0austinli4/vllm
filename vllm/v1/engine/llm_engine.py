@@ -303,6 +303,11 @@ class LLMEngine:
         with record_function_or_nullcontext("llm_engine step: abort_requests"):
             self.engine_core.abort_requests(processed_outputs.reqs_to_abort)
 
+        # 3.5) Submit probe requests spawned this iteration.
+        for probe_req in processed_outputs.new_probe_requests:
+            self.output_processor.add_request(probe_req, None, None, 0)
+            self.engine_core.add_request(probe_req)
+
         # 4) Record stats
         with record_function_or_nullcontext("llm_engine step: record_stats"):
             if self.logger_manager is not None and outputs.scheduler_stats is not None:
